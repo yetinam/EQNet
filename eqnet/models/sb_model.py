@@ -7,10 +7,10 @@ import numpy as np
 from torch import Tensor, nn
 import torch.nn.functional as F
 
-from .unet import UNet
+import eqnet.models.phasenet as phn
 
 
-class PhaseNet(sbm.WaveformModel):
+class PhaseNet(phn.PhaseNet, sbm.WaveformModel):
     # TODO: Update args
     _annotate_args = sbm.WaveformModel._annotate_args.copy()
     _annotate_args["*_threshold"] = ("Detection threshold for the provided phase", 0.3)
@@ -29,42 +29,42 @@ class PhaseNet(sbm.WaveformModel):
         **kwargs,
     ) -> None:
         super().__init__(
+            backbone="unet",
+            log_scale=log_scale,
+            add_stft=False,
+            add_polarity=add_polarity,
+            add_event=add_event,
+            event_center_loss_weight=1.0,
+            event_time_loss_weight=1.0,
+            polarity_loss_weight=1.0,
             in_samples=1024,
             output_type="array",
             pred_sample=(0, 1024),
             labels=["N", "P", "S", "Polarity", "Event center", "Event time"],
             sampling_rate=sampling_rate,
-            **kwargs,
-        )
-        self.add_event = add_event
-        self.add_polarity = add_polarity
-
-        self.backbone = UNet(log_scale=log_scale, add_polarity=add_polarity, add_event=add_event)
-
-        self.phase_picker = UNetHead(16, 3, feature_names="phase")
-        if self.add_event:
-            self.event_detector = UNetHead(32, 1, feature_names="event")
-            self.event_timer = EventHead(32, 1, feature_names="event")
-        if self.add_polarity:
-            self.polarity_picker = UNetHead(16, 3, feature_names="polarity")
-
+            )
+        
     def forward(self, data: Tensor, logits: bool = False) -> dict[str, Tensor]:
-        # data: (batch, channel, time, station)
         features = self.backbone(data)
-        # features: (batch, station, channel, time)
+        # features: (batch, channel, station, time)
 
-        output_phase = self.phase_picker(features, logits)
+        output_phase, _ = self.phase_picker(features)
+        if not logits:
+            output_phase = torch.softmax(output_phase, dim=1)
         output = {"phase": output_phase}
         if self.add_event:
-            output_event_center = self.event_detector(features, logits)
+            output_event_center, _ = self.event_detector(features)
+            if not logits:
+                output_event_center = torch.sigmoid(output_event_center)
             output["event_center"] = output_event_center
-            output_event_time = self.event_timer(features)
+            output_event_time, _ = self.event_timer(features)
             output["event_time"] = output_event_time
         if self.add_polarity:
-            output_polarity = self.polarity_picker(features, logits)
-            output["polarity_3c"] = output_polarity
-            # TODO: Check sign and components
-            output["polarity"] =  output_polarity[:, 2:3] - output_polarity[:, 1:2]
+            output_polarity, _ = self.polarity_picker(features)
+            if not logits:
+                output_polarity = torch.sigmoid(output_polarity)
+                output_polarity = (output_polarity - 0.5) * 2.0  # Convert to -1, 1
+            output["polarity"] = output_polarity
 
         return output
 
@@ -77,15 +77,15 @@ class PhaseNet(sbm.WaveformModel):
     def annotate_batch_pre(
             self, batch: torch.Tensor, argdict: dict[str, Any]
     ) -> torch.Tensor:
-        return batch.unsqueeze(-1)  # Add fake station dimension
+        return batch.unsqueeze(-2)  # Add fake station dimension
 
     def annotate_batch_post(
             self, batch: torch.Tensor, piggyback: Any, argdict: dict[str, Any]
     ) -> torch.Tensor:
-        y_phase = batch["phase"][..., 0]
-        y_polarity = batch["polarity"][..., 0]
-        y_center = torch.repeat_interleave(batch["event_center"][..., 0], 16, dim=-1)
-        y_time = torch.repeat_interleave(batch["event_time"][..., 0], 16, dim=-1)
+        y_phase = batch["phase"][..., 0, :]
+        y_polarity = batch["polarity"][..., 0, :]
+        y_center = torch.repeat_interleave(batch["event_center"][..., 0, :], 16, dim=-1)
+        y_time = torch.repeat_interleave(batch["event_time"][..., 0, :], 16, dim=-1)
 
         y_full = torch.concat([y_phase, y_polarity, y_center, y_time], dim=1)
 
@@ -147,48 +147,3 @@ class PhaseNet(sbm.WaveformModel):
         # TODO: Implement
 
         return sbu.ClassifyOutput(self.name)
-
-class UNetHead(nn.Module):
-    def __init__(
-        self, in_channels: int, out_channels: int, kernel_size=(7, 1), padding=(3, 0), feature_names: str = "phase"
-    ) -> None:
-        super().__init__()
-        self.out_channels = out_channels
-        self.feature_names = feature_names
-        self.layers = nn.Conv2d(
-            in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, padding=padding
-        )
-
-    def forward(self, features, logits: bool = False) -> Tensor:
-        x = features[self.feature_names]
-        x = self.layers(x)
-        if logits:
-            return x
-        else:
-            return F.softmax(x, dim=1)
-
-
-class EventHead(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size=(7, 1),
-        padding=(3, 0),
-        scaling=1000.0,
-        feature_names: str = "event",
-    ) -> None:
-        super().__init__()
-        self.out_channels = out_channels
-        self.feature_names = feature_names
-        self.scaling = scaling
-        self.layers = nn.Sequential(
-            nn.Conv2d(in_channels=in_channels, out_channels=in_channels, kernel_size=kernel_size, padding=padding),
-            nn.LeakyReLU(),
-            nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, padding=padding),
-            nn.LeakyReLU(),
-        )
-
-    def forward(self, features):
-        x = features[self.feature_names]
-        return self.layers(x) * self.scaling
